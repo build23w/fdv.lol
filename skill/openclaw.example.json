@@ -1,0 +1,34 @@
+{
+  "rpc": {
+    "url": "<YOUR_SOLANA_MAINNET_RPC_URL_FROM_QUICKNODE_https://quicknode.com/signup?via=lf>",
+    "headers": {}
+  },
+  "wallet": {
+    "secret": "<BASE58_64_BYTE_SECRETKEY_OR_JSON_ARRAY_STRING>",
+    "recipientPub": "<OPTIONAL_SOLANA_PUBKEY_FOR_RETURNS>"
+  },
+  "jupiter": {
+    "apiKey": "<YOUR_JUPITER_API_KEY_FROM_https://portal.jup.ag/pricing>"
+  },
+  "agentGaryFullAi": {
+    "enabled": true,
+    "model": "gpt-4o-mini",
+    "provider": "openai",
+    "riskLevel": "degen",
+    "fullAiControl": true,
+    "apiKey": "<YOUR_OPENAI_API_KEY>"
+  },
+  "auto": {
+    "enabled": true,
+    "tickMs": 250,
+    "budgetUi": 0.5,
+    "buyPct": 0.2,
+    "minBuySol": 0.06,
+    "maxBuySol": 0.12,
+    "finalPumpGateEnabled": false,
+    "takeProfitPct": 12,
+    "stopLossPct": 4,
+    "trailPct": 6,
+    "slippageBps": 250
+  }
+}

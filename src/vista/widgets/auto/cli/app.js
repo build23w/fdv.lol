@@ -107,6 +107,7 @@ import { SOLANA_RPC_URL as DEFAULT_SOLANA_RPC_URL } from "../../../../config/env
 import { runPipeline } from "../lib/pipeline.js";
 
 import { createPosCacheStore } from "../lib/stores/posCacheStore.js";
+import { createDustCacheStore } from "../lib/stores/dustCacheStore.js";
 
 import { createPreflightSellPolicy } from "../lib/sell/policies/preflight.js";
 import { createUrgentSellPolicy } from "../lib/sell/policies/urgent.js";

@@ -362,6 +362,11 @@ function _startCliMintReconciler({ rpcUrl, rpcHeaders, autoWalletSecret, interva
     log: debug ? (m) => { try { console.log(`[CLI recon] ${m}`); } catch {} } : () => {},
   });
 
+  const { isMintInDustCache } = createDustCacheStore({
+    keyPrefix: "fdv_dust_",
+    log: debug ? (m) => { try { console.log(`[CLI dust] ${m}`); } catch {} } : () => {},
+  });
+
   // Conservative "confirmed zero" cleanup (non-destructive):
   // only remove a cached mint after several consecutive *scanOk* snapshots show it at zero.
   const zeroConfirmNeeded = Math.max(2, Number(process?.env?.FDV_CLI_RECON_ZERO_CONFIRM || 3));
@@ -393,11 +398,19 @@ function _startCliMintReconciler({ rpcUrl, rpcHeaders, autoWalletSecret, interva
 
       // Update-only: never delete here (deletes are what burned us).
       if (owner) {
+        const dustUiEps = (() => {
+          const v = Number(process?.env?.FDV_DUST_UI_EPS || 0);
+          return Number.isFinite(v) && v > 0 ? v : 1e-6;
+        })();
+        const uiCmpEps = Math.max(1e-12, dustUiEps * 1e-6);
+
         for (const b of balances) {
           const mint = String(b?.mint || "").trim();
           if (!mint || mint === SOL_MINT) continue;
           const uiAmt = Number(b?.uiAmt || 0);
           if (!Number.isFinite(uiAmt) || uiAmt <= 0) continue;
+          if (uiAmt <= (dustUiEps + uiCmpEps)) continue;
+          try { if (isMintInDustCache(owner, mint)) continue; } catch {}
           updatePosCache(owner, mint, uiAmt, Number(b?.decimals || 0));
         }
 

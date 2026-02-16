@@ -30,6 +30,54 @@ export function createAgentDecisionPolicy({
   const _getState = typeof getState === "function" ? getState : () => ({});
   const _getAgent = typeof getAgent === "function" ? getAgent : () => null;
 
+  const _posForAgent = (pos, { nowTs } = {}) => {
+    try {
+      const p = pos && typeof pos === "object" ? pos : {};
+      return {
+        sizeUi: Number(p?.sizeUi || 0),
+        costSol: Number(p?.costSol || 0),
+        hwmSol: Number(p?.hwmSol || 0),
+        acquiredAt: Number(p?.acquiredAt || 0),
+        lastBuyAt: Number(p?.lastBuyAt || 0),
+        lastSellAt: Number(p?.lastSellAt || 0),
+        lastSeenAt: Number(p?.lastSeenAt || 0),
+        decimals: Number.isFinite(Number(p?.decimals)) ? Number(p.decimals) : undefined,
+
+        // Exit knobs attached to the position
+        tpPct: p?.tpPct != null ? Number(p.tpPct) : undefined,
+        slPct: p?.slPct != null ? Number(p.slPct) : undefined,
+        trailPct: p?.trailPct != null ? Number(p.trailPct) : undefined,
+        minProfitToTrailPct: p?.minProfitToTrailPct != null ? Number(p.minProfitToTrailPct) : undefined,
+
+        // Warm / grace context
+        warmingHold: p?.warmingHold != null ? !!p.warmingHold : undefined,
+        warmingHoldAt: p?.warmingHoldAt != null ? Number(p.warmingHoldAt) : undefined,
+        warmingMinProfitPct: p?.warmingMinProfitPct != null ? Number(p.warmingMinProfitPct) : undefined,
+        postWarmGraceUntil: p?.postWarmGraceUntil != null ? Number(p.postWarmGraceUntil) : undefined,
+
+        // Recent quote snapshot (optional)
+        lastQuotedSol: p?.lastQuotedSol != null ? Number(p.lastQuotedSol) : undefined,
+        lastQuotedAt: p?.lastQuotedAt != null ? Number(p.lastQuotedAt) : undefined,
+
+        // Entry meta that helps reasoning
+        entryChg5m: p?.entryChg5m != null ? Number(p.entryChg5m) : undefined,
+        entryPre: p?.entryPre != null ? Number(p.entryPre) : undefined,
+        entryPreMin: p?.entryPreMin != null ? Number(p.entryPreMin) : undefined,
+        entryScSlope: p?.entryScSlope != null ? Number(p.entryScSlope) : undefined,
+        entryEdgeExclPct: p?.entryEdgeExclPct != null ? Number(p.entryEdgeExclPct) : undefined,
+        entryEdgeCostPct: p?.entryEdgeCostPct != null ? Number(p.entryEdgeCostPct) : undefined,
+        entryTpBumpPct: p?.entryTpBumpPct != null ? Number(p.entryTpBumpPct) : undefined,
+        earlyNegScCount: p?.earlyNegScCount != null ? Number(p.earlyNegScCount) : undefined,
+
+        // Light entry status
+        lightEntry: p?.lightEntry != null ? !!p.lightEntry : undefined,
+        lightRemainingSol: p?.lightRemainingSol != null ? Number(p.lightRemainingSol) : undefined,
+      };
+    } catch {
+      return pos && typeof pos === "object" ? { ...pos } : {};
+    }
+  };
+
   return async function agentDecisionPolicy(ctx) {
     try {
       const agent = _getAgent();
@@ -162,6 +210,20 @@ export function createAgentDecisionPolicy({
         isFastExit: !!ctx?.isFastExit,
         inSellGuard: !!ctx?.inSellGuard,
 
+        // Explicit sell-guard remaining: helps prevent LLMs from misreading timestamps.
+        sellGuardUntilTs: (() => {
+          try { return Number(ctx?.pos?.sellGuardUntil || 0) || 0; } catch { return 0; }
+        })(),
+        sellGuardRemainingSec: (() => {
+          try {
+            const until = Number(ctx?.pos?.sellGuardUntil || 0) || 0;
+            const remMs = Math.max(0, until - nowTs);
+            return Math.floor(remMs / 1000);
+          } catch {
+            return 0;
+          }
+        })(),
+
         // Bot config snapshot (agent may supersede knobs; still useful as priors)
         cfg: {
           minHoldSecs: Number(state?.minHoldSecs ?? 0),
@@ -178,7 +240,8 @@ export function createAgentDecisionPolicy({
         systemDecision: ctx?.decision || null,
       };
 
-      const res = await agent.decideSell({ mint: ctx?.mint, pos: ctx?.pos || {}, ctx: payloadCtx });
+      const posForAgent = _posForAgent(ctx?.pos || {}, { nowTs });
+      const res = await agent.decideSell({ mint: ctx?.mint, pos: posForAgent, ctx: payloadCtx });
       if (!res?.ok || !res?.decision) return;
       const d = res.decision;
 

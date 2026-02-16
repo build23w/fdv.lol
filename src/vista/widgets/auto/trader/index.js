@@ -4082,7 +4082,7 @@ function dedupeComputeBudgetIxs(ixs = []) {
   }
 }
 
-async function computeSpendCeiling(ownerPubkeyStr, { solBalHint } = {}) {
+async function computeSpendCeiling(ownerPubkeyStr, { solBalHint, extraSellPosCount = 0 } = {}) {
   const solBal = Number.isFinite(solBalHint) ? solBalHint : await fetchSolBalance(ownerPubkeyStr);
   const solLamports = Math.floor(solBal * 1e9);
 
@@ -4094,9 +4094,27 @@ async function computeSpendCeiling(ownerPubkeyStr, { solBalHint } = {}) {
   const posCount = Object.entries(state.positions || {})
     .filter(([m, p]) => m !== SOL_MINT && Number(p?.sizeUi || 0) > 0).length;
 
-  const sellResLamports = posCount * (SELL_TX_FEE_BUFFER_LAMPORTS + EXTRA_TX_BUFFER_LAMPORTS);
+  // Reserve enough native SOL to pay for swap-backs after entries.
+  // This is especially important when Jupiter wraps SOL into WSOL, which can leave fee-payer SOL low.
+  const _readSwapbackReserveSol = () => {
+    try {
+      const fromEnv = String((typeof process !== "undefined" && process?.env) ? (process.env.FDV_SWAPBACK_RESERVE_SOL || "") : "").trim();
+      const fromLs = (() => {
+        try { return String(globalThis?.localStorage?.getItem?.("fdv_swapback_reserve_sol") || "").trim(); } catch { return ""; }
+      })();
+      const raw = fromEnv || fromLs;
+      const n = Number(raw);
+      if (Number.isFinite(n) && n > 0) return Math.max(0.001, Math.min(2, n));
+    } catch {}
+    return 0.02;
+  };
 
-  const minRunwayLamports = Math.floor(MIN_OPERATING_SOL * 1e9);
+  const extraPos = Math.max(0, Number(extraSellPosCount || 0) || 0);
+  const posCountAssumed = Math.max(0, posCount + extraPos);
+
+  const sellResLamports = posCountAssumed * (SELL_TX_FEE_BUFFER_LAMPORTS + EXTRA_TX_BUFFER_LAMPORTS);
+
+  const minRunwayLamports = Math.floor(Math.max(MIN_OPERATING_SOL, _readSwapbackReserveSol()) * 1e9);
 
   const totalResLamports = Math.max(minRunwayLamports, baseReserveLamports + sellResLamports);
 
@@ -4113,6 +4131,8 @@ async function computeSpendCeiling(ownerPubkeyStr, { solBalHint } = {}) {
       minRunwayLamports,
       totalResLamports,
       posCount,
+      extraSellPosCount: extraPos,
+      posCountAssumed,
     }
   };
 }
@@ -6451,10 +6471,68 @@ export async function closeAllEmptyAtas(signer) {
   return _getDex().closeAllEmptyAtas(signer);
 }
 
-async function syncPositionsFromChain(ownerPubkeyStr) {
+// Position-cache sync can be invoked from multiple hot paths (buy sizing, sell eval,
+// observers). De-dupe concurrent calls and throttle frequency to avoid log spam and
+// repeated localStorage parsing. improtant
+const _posCacheSyncGlobal = (() => {
   try {
-    log("Syncing positions from cache …");
-    const nowTs = now();
+    const g = typeof globalThis !== "undefined" ? globalThis : null;
+    if (g) {
+      if (!g.__fdvPosCacheSyncState || typeof g.__fdvPosCacheSyncState !== "object") {
+        g.__fdvPosCacheSyncState = {
+          inFlight: new Map(),
+          lastAt: new Map(),
+          lastLogAt: new Map(),
+        };
+      }
+      return g.__fdvPosCacheSyncState;
+    }
+  } catch {}
+  return { inFlight: new Map(), lastAt: new Map(), lastLogAt: new Map() };
+})();
+
+const _posCacheSyncInFlight = _posCacheSyncGlobal.inFlight;
+const _posCacheSyncLastAt = _posCacheSyncGlobal.lastAt;
+const _posCacheSyncLastLogAt = _posCacheSyncGlobal.lastLogAt;
+
+async function syncPositionsFromChain(ownerPubkeyStr) {
+  const ownerKey = String(ownerPubkeyStr || "");
+  if (!ownerKey) return;
+
+  const syncLogEnabled = (() => {
+    try {
+      const raw = String(typeof process !== "undefined" ? process?.env?.FDV_SYNC_POSCACHE_DEBUG : "").trim();
+      if (!raw) return false;
+      return /^(1|true|yes|y|on)$/i.test(raw);
+    } catch {
+      return false;
+    }
+  })();
+
+  const existing = _posCacheSyncInFlight.get(ownerKey);
+  if (existing) {
+    try {
+      await existing;
+    } catch {}
+    return;
+  }
+
+  const lastAt = Number(_posCacheSyncLastAt.get(ownerKey) || 0);
+  const nowTs0 = now();
+  // Avoid re-syncing more than ~1x/sec per owner unless a previous call finished long ago.
+  if (nowTs0 - lastAt < 900) return;
+
+  const p = (async () => {
+    try {
+      if (syncLogEnabled) {
+        const lastLogAt = Number(_posCacheSyncLastLogAt.get(ownerKey) || 0);
+        if (nowTs0 - lastLogAt > 5000) {
+          _posCacheSyncLastLogAt.set(ownerKey, nowTs0);
+          log("Syncing positions from cache …");
+        }
+      }
+
+      const nowTs = now();
 
     const dustUiEps = (() => {
       const v = Number(typeof process !== "undefined" ? process?.env?.FDV_DUST_UI_EPS : 0);
@@ -6479,12 +6557,13 @@ async function syncPositionsFromChain(ownerPubkeyStr) {
       try {
         const uiAmt = Number(it?.sizeUi || 0);
         const dec = Number.isFinite(Number(it?.decimals)) ? Number(it.decimals) : 6;
-        const rawApprox = (Number.isFinite(uiAmt) && dec >= 0 && dec <= 9)
+        const rawApprox = (Number.isFinite(uiAmt) && dec >= 0 && dec <= 12)
           ? Math.round(uiAmt * Math.pow(10, dec))
           : null;
-        const isDust = (Number.isFinite(rawApprox) && rawApprox !== null)
-          ? rawApprox <= dustRawMax
-          : (Number.isFinite(uiAmt) && uiAmt > 0 && uiAmt <= dustUiEps);
+        const uiCmpEps = Math.max(1e-12, dustUiEps * 1e-6);
+        const isDustUi = Number.isFinite(uiAmt) && uiAmt > 0 && uiAmt <= (dustUiEps + uiCmpEps);
+        const isDustRaw = Number.isFinite(rawApprox) && rawApprox !== null ? rawApprox <= dustRawMax : false;
+        const isDust = isDustUi || isDustRaw;
         if (isDust) {
           moveRemainderToDust(ownerPubkeyStr, it.mint, uiAmt, dec);
           removeFromPosCache(ownerPubkeyStr, it.mint);
@@ -6529,8 +6608,17 @@ async function syncPositionsFromChain(ownerPubkeyStr) {
     }
 
     save();
-  } catch (e) {
-    log(`Sync failed: ${e.message || e}`);
+    } catch (e) {
+      log(`Sync failed: ${e.message || e}`);
+    }
+  })();
+
+  _posCacheSyncInFlight.set(ownerKey, p);
+  try {
+    await p;
+  } finally {
+    _posCacheSyncInFlight.delete(ownerKey);
+    _posCacheSyncLastAt.set(ownerKey, now());
   }
 }
 
@@ -6994,16 +7082,17 @@ async function verifyRealTokenBalance(ownerPub, mint, pos) {
         return Number.isFinite(v) && v > 0 ? v : 1e-6;
       })();
       const dec = Number.isFinite(Number(bal.decimals)) ? Number(bal.decimals) : Number(pos.decimals ?? 6);
-      const rawApprox = (Number.isFinite(chainUi) && dec >= 0 && dec <= 9)
+      const rawApprox = (Number.isFinite(chainUi) && dec >= 0 && dec <= 12)
         ? Math.round(chainUi * Math.pow(10, dec))
         : null;
       const dustRawMax = (() => {
         const v = Number(typeof process !== "undefined" ? process?.env?.FDV_DUST_RAW_MAX : 0);
         return Number.isFinite(v) && v >= 0 ? Math.floor(v) : 1;
       })();
-      const isDust = (Number.isFinite(rawApprox) && rawApprox !== null)
-        ? rawApprox <= dustRawMax
-        : (Number.isFinite(chainUi) && chainUi > 0 && chainUi <= dustUiEps);
+      const uiCmpEps = Math.max(1e-12, dustUiEps * 1e-6);
+      const isDustUi = Number.isFinite(chainUi) && chainUi > 0 && chainUi <= (dustUiEps + uiCmpEps);
+      const isDustRaw = Number.isFinite(rawApprox) && rawApprox !== null ? rawApprox <= dustRawMax : false;
+      const isDust = isDustUi || isDustRaw;
 
       const ageMs0 = now() - Number(pos.lastBuyAt || pos.acquiredAt || 0);
       const graceMs0 = Math.max(10_000, Number(state.pendingGraceMs || 20_000));
@@ -8401,21 +8490,8 @@ async function tick() {
       log(`SOL low (${solBal.toFixed(4)}); skipping new buys to avoid router dust.`);
       return;
     }
-    const ceiling = await computeSpendCeiling(kp.publicKey.toBase58(), { solBalHint: solBal });
-
     const desired      = Math.min(state.maxBuySol, Math.max(state.minBuySol, solBal * state.buyPct));
     const minThreshold = Math.max(state.minBuySol, MIN_SELL_SOL_OUT);
-    let plannedTotal   = Math.min(ceiling.spendableSol, Math.min(state.maxBuySol, desired));
-
-
-    logObj("Buy sizing (pre-split)", {
-      solBal: Number(solBal).toFixed(6),
-      spendable: Number(ceiling.spendableSol).toFixed(6),
-      posCount: ceiling.reserves.posCount,
-      reservesSol: (ceiling.reserves.totalResLamports/1e9).toFixed(6),
-      minThreshold
-    });
-
 
     let buyCandidates = picks.filter(m => {
       if (_isMintQuarantined(m, { allowHeld: true })) return false;
@@ -8470,6 +8546,21 @@ async function tick() {
       return;
     }
 
+    let loopN = leaderMode ? 1 : (state.allowMultiBuy ? buyCandidates.length : 1);
+    const ceiling = await computeSpendCeiling(kp.publicKey.toBase58(), { solBalHint: solBal, extraSellPosCount: loopN });
+
+    let plannedTotal   = Math.min(ceiling.spendableSol, Math.min(state.maxBuySol, desired));
+
+    logObj("Buy sizing (pre-split)", {
+      solBal: Number(solBal).toFixed(6),
+      spendable: Number(ceiling.spendableSol).toFixed(6),
+      posCount: ceiling.reserves.posCount,
+      posCountAssumed: ceiling.reserves.posCountAssumed,
+      reservesSol: (ceiling.reserves.totalResLamports/1e9).toFixed(6),
+      minThreshold,
+      plannedBuys: loopN,
+    });
+
     if (plannedTotal < minThreshold) {
       // state.carrySol += desired;
       const carryPrev = Math.max(0, Number(state.carrySol || 0));
@@ -8486,7 +8577,15 @@ async function tick() {
     let spent = 0;
     let buysDone = 0;
 
-    let loopN = leaderMode ? 1 : (state.allowMultiBuy ? buyCandidates.length : 1);
+    if (!leaderMode && state.allowMultiBuy && loopN > 1) {
+      try {
+        const maxByBudget = Math.max(1, Math.floor(plannedTotal / Math.max(1e-12, minThreshold)));
+        if (maxByBudget < loopN) {
+          loopN = Math.max(1, maxByBudget);
+          log(`Budget split: forcing ${loopN} buy(s) this tick (plannedTotal=${plannedTotal.toFixed(6)} SOL; minThreshold=${minThreshold.toFixed(6)} SOL).`);
+        }
+      } catch {}
+    }
 
     try {
       if (!leaderMode && loopN > 1) {
@@ -8588,8 +8687,8 @@ async function tick() {
         }
       }
 
-      // const left = Math.max(1, loopN - i);
-      const target = Math.min(plannedTotal, remaining);
+      const left = Math.max(1, loopN - i);
+      const target = Math.max(0, Math.min(plannedTotal, remaining) / left);
 
       if (!agentBypassNonEdgeGates) {
         try {
